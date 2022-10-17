@@ -113,6 +113,10 @@ linode_firewall_spec: dict = dict(
     state=dict(type='str',
                description='The desired state of the target.',
                choices=['present', 'absent'], required=True),
+    change=dict(type='str',
+                description='The rule change action to take.',
+                default='all',
+                choices=['all', 'delta+', 'delta-'])
 )
 
 
@@ -223,7 +227,7 @@ class LinodeFirewall(LinodeModuleBase):
             self._delete_device(device)
 
     @staticmethod
-    def _normalize_ips(rules: list) -> list:
+    def _normalize_addresses(rules: list) -> list:
         result = []
         for rule in rules:
             item = copy.deepcopy(rule)
@@ -242,25 +246,79 @@ class LinodeFirewall(LinodeModuleBase):
 
         return result
 
-    def _rules_changed(self) -> bool:
-        """Returns whether the local and remote firewall rules match."""
+    def _change_rules(self, change: str) -> list:
+        """Changes remote firewall rules relative to user-supplied new rules, and returns whether anything changed."""
         local_rules = filter_null_values_recursive(self.module.params['rules'])
         remote_rules = filter_null_values_recursive(mapping_to_dict(self._firewall.rules))
 
         # Normalize IP addresses for all rules
-        for field in {'inbound', 'outbound'}:
-            if field in local_rules:
-                local_rules[field] = self._normalize_ips(local_rules[field])
-            else:
-                # We should normalize missing keys to [] for diffing purposes
-                local_rules[field] = []
+        for field in ['inbound', 'outbound']:
+            local_rules[field] = self._normalize_addresses(local_rules[field]) if field in local_rules else []
+            remote_rules[field] = self._normalize_addresses(remote_rules[field]) if field in remote_rules else []
 
-            if field in remote_rules:
-                remote_rules[field] = self._normalize_ips(remote_rules[field])
+        if change != "all":
+            # add/delete IP addresses specified from in/out bound rules
+            for field in ['inbound', 'outbound']:
+                self._change_rule(remote_rules[field],local_rules[field],change)
 
-        return local_rules != remote_rules
+            # When adding/deleting ips, the relevant inbound/outbound
+            # rules are adjusted; and all other rules are not supplied
+            # by the user. For this reson, sync the missing rules as
+            # the REST API expects to fully update a
+            # linode_firewall_rules spec.
+            for field in ['inbound', 'inbound_policy', 'outbound', 'outbound_policy']:
+                if field not in local_rules:
+                    local_rules[field]=remote_rules[field]
 
-    def _update_firewall(self) -> None:
+        local_rules = filter_null_values_recursive(local_rules)
+        return local_rules if local_rules != remote_rules else []
+
+    @staticmethod
+    def _get_labeled_rules(rules: list) -> dict:
+        labels = {}
+        for rule in rules:
+            if 'label' in rule: 
+                labels[rule['label']]=rule
+        return labels
+        
+    def _change_rule(self, remote_rules: list, local_rules: list, change: str) -> None:
+        # User specified to either add or del addresses in rules
+
+        local_labeled_rules = self._get_labeled_rules(local_rules)
+        remote_labeled_rules = self._get_labeled_rules(remote_rules)
+
+        for local_label, local_rule in local_labeled_rules.items():
+            if local_label not in remote_labeled_rules:
+                # When the local_rule does not exist in remote_rule, it will be created.
+                # For this reason, it is ok to do nothing!
+                continue
+
+            # process changes in two phases:
+            # 1) adjust addresses per change delta
+            # 2) sync missing fields
+
+            # update addresses
+            for ip in ['ipv4','ipv6']:
+                remote_rule = remote_labeled_rules[local_label]
+                remote_set = set(remote_rule['addresses'].get(ip,[]))
+                local_set = set(local_rule['addresses'].get(ip,[]))
+                if change=='delta+':
+                    result_set = remote_set.union(local_set)
+                else: # change=='delta-'
+                    result_set = remote_set.difference(local_set)
+                local_rule['addresses'][ip] = sorted(list(result_set))
+                
+            # sync missing fields in local rules from remote rules
+            for field in linode_firewall_rule_spec.keys():
+                if field not in local_rule:
+                    local_rule[field]=remote_rule[field]
+
+        # insert all missing labeled remote rules to local rules
+        for remote_label, remote_rule in remote_labeled_rules.items():
+            if remote_label not in local_labeled_rules:
+                local_rules.append(remote_rule)
+
+    def _update_firewall(self, change: str) -> None:
         """Handles all update functionality for the current Firewall"""
 
         # Update mutable values
@@ -284,8 +342,9 @@ class LinodeFirewall(LinodeModuleBase):
         if should_update:
             self._firewall.save()
 
-        if self._rules_changed():
-            self._firewall.update_rules(filter_null_values_recursive(params.get('rules')))
+        changes = self._change_rules(change)
+        if changes:
+            self._firewall.update_rules(changes)
             self.register_action('Updated Firewall rules')
 
         # Update devices
@@ -293,7 +352,7 @@ class LinodeFirewall(LinodeModuleBase):
         if devices is not None:
             self._update_devices(devices)
 
-    def _handle_present(self) -> None:
+    def _handle_present(self, change: str) -> None:
         """Updates the Firewall"""
         label = self.module.params.get('label')
 
@@ -303,7 +362,7 @@ class LinodeFirewall(LinodeModuleBase):
             self._firewall = self._create_firewall()
             self.register_action('Created Firewall {0}'.format(label))
 
-        self._update_firewall()
+        self._update_firewall(change)
 
         self._firewall._api_get()
 
@@ -331,7 +390,8 @@ class LinodeFirewall(LinodeModuleBase):
             self._handle_absent()
             return self.results
 
-        self._handle_present()
+        change = kwargs.get('change','all')
+        self._handle_present(change)
         return self.results
 
 
